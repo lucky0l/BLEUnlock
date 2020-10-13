@@ -2,6 +2,20 @@ import Foundation
 import CoreBluetooth
 import Accelerate
 
+func getMACFromUUID(_ uuid: String) -> String? {
+    guard let plist = NSDictionary(contentsOfFile: "/Library/Preferences/com.apple.Bluetooth.plist") else { return nil }
+    guard let cbcache = plist["CoreBluetoothCache"] as? NSDictionary else { return nil }
+    guard let device = cbcache[uuid] as? NSDictionary else { return nil }
+    return device["DeviceAddress"] as? String
+}
+
+func getNameFromMAC(_ mac: String) -> String? {
+    guard let plist = NSDictionary(contentsOfFile: "/Library/Preferences/com.apple.Bluetooth.plist") else { return nil }
+    guard let devcache = plist["DeviceCache"] as? NSDictionary else { return nil }
+    guard let device = devcache[mac] as? NSDictionary else { return nil }
+    return device["Name"] as? String
+}
+
 class Device: NSObject {
     let uuid : UUID!
     var peripheral : CBPeripheral?
@@ -10,9 +24,22 @@ class Device: NSObject {
     var advData: Data?
     var rssi: Int = 0
     var scanTimer: Timer?
+    var macAddr: String?
+    var blName: String?
     
     override var description: String {
         get {
+            if macAddr == nil {
+                macAddr = getMACFromUUID(uuid.description)
+            }
+            if let mac = macAddr {
+                blName = getNameFromMAC(mac)
+                if let name = blName {
+                    if name != "iPhone" && name != "iPad" {
+                        return name
+                    }
+                }
+            }
             if let manu = manufacture {
                 if let mod = model {
                     if manu == "Apple Inc." && appleDeviceNames[mod] != nil {
@@ -31,6 +58,7 @@ class Device: NSObject {
             if let mod = model {
                 return mod
             }
+            // iBeacon
             if let adv = advData {
                 var iBeaconPrefix : [uint16] = [0x004c, 0x01502]
                 if adv[0...3] == Data(bytes: &iBeaconPrefix, count: 4) {
@@ -41,6 +69,12 @@ class Device: NSObject {
                     let d = String(format:"%.1f", distance)
                     return "iBeacon [\(major), \(minor)] \(d)m"
                 }
+            }
+            if let name = blName {
+                return name
+            }
+            if let mac = macAddr {
+                return mac // better than uuid
             }
             return uuid.description
         }
@@ -83,16 +117,36 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var lastReadAt = 0.0
     var powerWarn = true
     var passiveMode = false
-    var thresholdRSSI = -80
+    var thresholdRSSI = -70
     var latestRSSIs: [Double] = []
     var latestN: Int = 5
+    var activeModeTimer : Timer? = nil
+
+    func scanForPeripherals() {
+        guard !centralMgr.isScanning else { return }
+        centralMgr.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        //print("Start scanning")
+    }
 
     func startScanning() {
         scanMode = true
+        scanForPeripherals()
     }
 
     func stopScanning() {
         scanMode = false
+        if activeModeTimer != nil {
+            centralMgr.stopScan()
+        }
+    }
+
+    func setPassiveMode(_ mode: Bool) {
+        passiveMode = mode
+        if passiveMode {
+            activeModeTimer?.invalidate()
+            activeModeTimer = nil
+        }
+        scanForPeripherals()
     }
 
     func startMonitor(uuid: UUID) {
@@ -104,6 +158,9 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         resetSignalTimer()
         presence = true
         monitoredPeripheral = nil
+        activeModeTimer?.invalidate()
+        activeModeTimer = nil
+        scanForPeripherals()
     }
 
     func resetSignalTimer() {
@@ -125,7 +182,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         switch central.state {
         case .poweredOn:
             print("Bluetooth powered on")
-            centralMgr.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            scanForPeripherals()
             if let p = monitoredPeripheral {
                 central.cancelPeripheralConnection(p)
             }
@@ -164,7 +221,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func updateMonitoredPeripheral(_ rssi: Int) {
         if let p = monitoredPeripheral {
-            if !scanMode && p.state == .disconnected && !passiveMode {
+            if !passiveMode && activeModeTimer == nil {
+                //print("connecting")
                 centralMgr.connect(p, options: nil)
             }
         }
@@ -211,7 +269,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 if monitoredPeripheral == nil {
                     monitoredPeripheral = peripheral
                 }
-                if peripheral.state != .connected {
+                if activeModeTimer == nil {
                     updateMonitoredPeripheral(rssi)
                     //print("Discover \(rssi)dBm")
                 }
@@ -255,27 +313,17 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     //MARK:- CBCentralManagerDelegate start
+
     func centralManager(_ central: CBCentralManager,
                         didConnect peripheral: CBPeripheral)
     {
         peripheral.delegate = self
-        peripheral.discoverServices([DeviceInformation])
+        if scanMode {
+            peripheral.discoverServices([DeviceInformation])
+        }
         if peripheral == monitoredPeripheral && !passiveMode {
             peripheral.readRSSI()
-            lastReadAt = Date().timeIntervalSince1970
         }
-    }
-
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        guard peripheral == monitoredPeripheral else { return }
-        guard !passiveMode else { return }
-        central.connect(peripheral, options: nil)
-    }
-
-    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        guard peripheral == monitoredPeripheral else { return }
-        guard !passiveMode else { return }
-        central.connect(peripheral, options: nil)
     }
 
     //MARK:CBCentralManagerDelegate end -
@@ -286,23 +334,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let rssi = RSSI.intValue > 0 ? 0 : RSSI.intValue
         updateMonitoredPeripheral(rssi)
         //print("readRSSI \(rssi)dBm")
+        centralMgr.cancelPeripheralConnection(peripheral)
 
-        var interval: TimeInterval
-        if lastReadAt > 0 {
-            interval = 2.0 - (Date().timeIntervalSince1970 - lastReadAt)
-            if interval < 0 {
-                interval = 0
-            }
-        } else {
-            interval = 0
+        if activeModeTimer == nil && !passiveMode{
+            print("Entering active mode")
+            centralMgr.stopScan()
+            activeModeTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true, block: { _ in
+                self.centralMgr.connect(peripheral, options: nil)
+            })
+            RunLoop.main.add(activeModeTimer!, forMode: .common)
         }
-        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false, block: { _ in
-            if peripheral.state == .connected {
-                peripheral.readRSSI()
-                self.lastReadAt = Date().timeIntervalSince1970
-            }
-        })
-        RunLoop.main.add(timer, forMode: .common)
     }
 
     func peripheral(_ peripheral: CBPeripheral,

@@ -74,7 +74,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
     
     func menuItemTitle(device: Device) -> String {
-        return String(format: "%@ (%ddBm)", device.description, device.rssi)
+        var desc : String!
+        if let mac = device.macAddr {
+            let prettifiedMac = mac.replacingOccurrences(of: "-", with: ":").uppercased()
+            desc = String(format: "%@ (%@)", device.description, prettifiedMac)
+        } else {
+            desc = device.description
+        }
+        return String(format: "%@ (%ddBm)", desc, device.rssi)
     }
     
     func newDevice(device: Device) {
@@ -145,11 +152,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         }
     }
 
-    func runScript(_ name: String) {
+    func runScript(_ arg: String) {
         guard let directory = try? FileManager.default.url(for: .applicationScriptsDirectory, in: .userDomainMask, appropriateFor: nil, create: true) else { return }
-        let file = directory.appendingPathComponent(name)
+        let file = directory.appendingPathComponent("event")
         let process = Process()
         process.executableURL = file
+        process.arguments = [arg]
         try? process.run()
     }
 
@@ -215,7 +223,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
                 pauseItunes()
                 if lockScreen() {
                     notifyUser(reason)
-                    runScript("locked")
+                    runScript(reason)
                 } else {
                     print("Failed to lock")
                 }
@@ -268,6 +276,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
 
     @objc func onDisplayWake() {
         print("display wake")
+        unlockedAt = Date().timeIntervalSince1970
         displaySleep = false
         wakeTimer?.invalidate()
         wakeTimer = nil
@@ -294,7 +303,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     @objc func onUnlock() {
-        if Date().timeIntervalSince1970 >= unlockedAt + 10 {
+        if Date().timeIntervalSince1970 >= unlockedAt + 2 {
             runScript("intruded")
         }
         manualLock = false
@@ -466,7 +475,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         let passiveMode = !prefs.bool(forKey: "passiveMode")
         prefs.set(passiveMode, forKey: "passiveMode")
         menuItem.state = passiveMode ? .on : .off
-        ble.passiveMode = passiveMode
+        ble.setPassiveMode(passiveMode)
     }
 
     @objc func lockNow() {
@@ -517,6 +526,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
 
         let timeoutItem = mainMenu.addItem(withTitle: t("timeout"), action: nil, keyEquivalent: "")
         timeoutItem.submenu = timeoutMenu
+        timeoutMenu.addItem(withTitle: "15 " + t("seconds"), action: #selector(setTimeout), keyEquivalent: "").tag = 15
         timeoutMenu.addItem(withTitle: "30 " + t("seconds"), action: #selector(setTimeout), keyEquivalent: "").tag = 30
         timeoutMenu.addItem(withTitle: "1 " + t("minute"), action: #selector(setTimeout), keyEquivalent: "").tag = 60
         timeoutMenu.addItem(withTitle: "2 " + t("minutes"), action: #selector(setTimeout), keyEquivalent: "").tag = 120
@@ -591,7 +601,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         if timeout != 0 {
             ble.signalTimeout = Double(timeout)
         }
-        ble.passiveMode = prefs.bool(forKey: "passiveMode")
+        ble.setPassiveMode(prefs.bool(forKey: "passiveMode"))
         let thresholdRSSI = prefs.integer(forKey: "thresholdRSSI")
         if thresholdRSSI != 0 {
             ble.thresholdRSSI = thresholdRSSI
